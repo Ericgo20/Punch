@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Heures & Salaire</title>
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;max-width:980px;margin:0 auto;padding:16px;color:#111}
+ h1{margin:0;font-size:1.2rem}
+ label{display:block;margin-top:8px;font-size:0.95rem}
+ input,button{padding:8px;border:1px solid #ccc;border-radius:6px;font-size:0.95rem}
+ .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+ table{width:100%;border-collapse:collapse;margin-top:12px}
+ th,td{border:1px solid #ddd;padding:8px;text-align:left;font-size:0.9rem}
+ th{background:#f6f6f6}
+ .small{font-size:0.85rem;color:#555}
+ .actions{margin-top:12px;display:flex;gap:8px;flex-wrap:wrap}
+ .summary{margin-top:12px;padding:10px;border-radius:8px;background:#fbfbfb;border:1px solid #eee}
+ .week-block{margin-top:10px;padding:8px;border-radius:6px;border:1px dashed #ddd}
+</style>
+</head>
+<body>
+
+<h1>Calcul heures & salaire</h1>
+
+<section>
+ <label><strong>Taux horaire ($/h)</strong></label>
+ <input id="hourlyRate" type="number" min="0" step="0.01" style="width:140px" />
+
+ <div class="row">
+   <div>
+     <label>Date</label>
+     <input id="date" type="date" />
+   </div>
+   <div>
+     <label>Entrée</label>
+     <input id="startTime" type="time" />
+   </div>
+   <div>
+     <label>Sortie</label>
+     <input id="endTime" type="time" />
+   </div>
+   <div>
+     <label>Pause (minutes)</label>
+     <input id="pause" type="number" min="0" value="0" />
+   </div>
+ </div>
+
+ <div class="small" style="margin-top:8px">
+   Prime nuit : 2$/h (19h → 07h) • Prime fin semaine : 5$/h (ven 17h → lun 05h)
+ </div>
+
+ <div class="actions">
+   <button id="addShiftBtn">Ajouter le shift</button>
+   <button id="clearBtn">Effacer tout</button>
+   <button id="exportBtn">Exporter CSV</button>
+ </div>
+
+ <table id="shiftsTable" hidden>
+   <thead>
+     <tr>
+       <th>Date</th><th>Entrée</th><th>Sortie</th><th>Pause</th>
+       <th>Heures</th><th>Nuit h</th><th>Fin sem. h</th><th>Salaire $</th><th></th>
+     </tr>
+   </thead>
+   <tbody></tbody>
+ </table>
+
+ <div class="summary" id="summary" hidden>
+   <h3>Récapitulatif</h3>
+   <div id="totals" class="small"></div>
+   <div id="weeks"></div>
+ </div>
+</section>
+
+<script>
+/* ====== Stockage ====== */
+const STORAGE_KEY = "shifts_v2";
+const RATE_KEY = "hourly_rate";
+
+function loadShifts(){ try{ return JSON.parse(localStorage.getItem(STORAGE_KEY))||[] }catch(e){return []}}
+function saveShifts(x){ localStorage.setItem(STORAGE_KEY, JSON.stringify(x)) }
+function loadRate(){ return Number(localStorage.getItem(RATE_KEY)||0) }
+function saveRate(v){ localStorage.setItem(RATE_KEY, v) }
+
+/* ===== utilitaires ===== */
+function parseDT(d,t){
+ if(!d||!t) return null;
+ const [Y,M,D]=d.split('-').map(Number);
+ const [h,m]=t.split(':').map(Number);
+ return new Date(Y,M-1,D,h,m,0,0);
+}
+function minutesBetween(a,b){ return Math.max(0,(b-a)/60000) }
+function overlap(a1,a2,b1,b2){
+ const s = Math.max(a1,b1), e = Math.min(a2,b2);
+ return Math.max(0,(e-s)/60000);
+}
+
+/* weekend prime window (Fri 17:00 → Mon 05:00) */
+function weekendWindow(date){
+ const d=new Date(date);
+ const day=d.getDay(); // 0=Sun
+ const sunday=new Date(d); sunday.setDate(d.getDate()-day);
+ const friday=new Date(sunday); friday.setDate(sunday.getDate()+5);
+ const start=new Date(friday); start.setHours(17,0,0,0);
+ const end=new Date(friday); end.setDate(friday.getDate()+3); end.setHours(5,0,0,0);
+ return [start,end];
+}
+
+/* night windows for each day */
+function nightWindows(start,end){
+ const out=[];
+ const d=new Date(start); d.setHours(0,0,0,0);
+ const endd=new Date(end); endd.setHours(0,0,0,0);
+ for(let dt=new Date(d); dt<=endd; dt.setDate(dt.getDate()+1)){
+   const s=new Date(dt); s.setHours(19,0,0,0);
+   const e=new Date(dt); e.setDate(e.getDate()+1); e.setHours(7,0,0,0);
+   out.push([s,e]);
+ }
+ return out;
+}
+
+/* Sunday-start week key */
+function weekKey(d){
+ const dt=new Date(d);
+ const day=dt.getDay(); // 0=Sun
+ const sunday=new Date(dt); sunday.setDate(dt.getDate()-day);
+ sunday.setHours(0,0,0,0);
+ return sunday.toISOString().slice(0,10);
+}
+
+/* Analyze shift including salary */
+function analyze(s, rate){
+ const st=parseDT(s.date,s.start), en0=parseDT(s.date,s.end);
+ if(!st||!en0) return null;
+ let en=en0;
+ if(en <= st){ en=new Date(en0); en.setDate(en0.getDate()+1); }
+
+ const totalMin = minutesBetween(st,en) - (s.pauseMin||0);
+ const hours = totalMin/60;
+
+ const [wS,wE] = weekendWindow(st);
+ const wMin = overlap(st,en,wS,wE);
+
+ let nightMin=0;
+ for(const [ns,ne] of nightWindows(st,en)){
+   nightMin += overlap(st,en,ns,ne);
+ }
+
+ const nightH = nightMin/60;
+ const weekendH = wMin/60;
+
+ // salary
+ const base = hours * rate;
+ const nightBonus = nightH * 2;
+ const weekendBonus = weekendH * 5;
+ const totalPay = base + nightBonus + weekendBonus;
+
+ return {st,en,hours,nightH,weekendH,totalPay};
+}
+
+/* ===== UI ===== */
+let shifts = loadShifts();
+
+const rateInput = document.getElementById("hourlyRate");
+rateInput.value = loadRate();
+rateInput.addEventListener("input", e => { saveRate(e.target.value); render(); });
+
+const tbody=document.querySelector("#shiftsTable tbody");
+const table=document.getElementById("shiftsTable");
+const summary=document.getElementById("summary");
+const totalsDiv=document.getElementById("totals");
+const weeksDiv=document.getElementById("weeks");
+
+function render(){
+ tbody.innerHTML="";
+ const rate = loadRate();
+
+ if(shifts.length===0){
+   table.hidden=true; summary.hidden=true;
+   return;
+ }
+
+ table.hidden=false; summary.hidden=false;
+
+ const analyzed = shifts.map(s => ({raw:s, a:analyze(s, rate)}));
+
+ analyzed.forEach((x,i)=>{
+   const s=x.raw, a=x.a;
+   const tr=document.createElement("tr");
+   tr.innerHTML=`
+     <td>${s.date}</td>
+     <td>${s.start}</td>
+     <td>${s.end}</td>
+     <td>${s.pauseMin||0}</td>
+     <td>${a.hours.toFixed(2)}</td>
+     <td>${a.nightH.toFixed(2)}</td>
+     <td>${a.weekendH.toFixed(2)}</td>
+     <td>${a.totalPay.toFixed(2)}$</td>
+     <td><button data-i="${i}" class="delBtn">X</button></td>
+   `;
+   tbody.appendChild(tr);
+ });
+
+ // group by sunday-start week
+ const weeks={};
+ for(const it of analyzed){
+   const a=it.a;
+   const k=weekKey(a.st);
+   if(!weeks[k]) weeks[k]={min:0,pay:0};
+   weeks[k].min += a.hours*60;
+   weeks[k].pay += a.totalPay;
+ }
+
+ let sumH=0, sumPay=0;
+ weeksDiv.innerHTML="";
+
+ Object.keys(weeks).sort().forEach(k=>{
+   const w=weeks[k];
+   const h=w.min/60;
+   sumH+=h; sumPay+=w.pay;
+
+   const sun=new Date(k);
+   const sat=new Date(k); sat.setDate(sun.getDate()+6);
+
+   const blk=document.createElement("div");
+   blk.className="week-block";
+   blk.innerHTML=`
+     <strong>Semaine du ${sun.toLocaleDateString()} au ${sat.toLocaleDateString()}</strong>
+     <div class="small">
+       Heures : ${h.toFixed(2)} h —
+       Salaire brut : ${w.pay.toFixed(2)} $
+     </div>
+   `;
+   weeksDiv.appendChild(blk);
+ });
+
+ totalsDiv.innerHTML=`
+   <div>Total heures : ${sumH.toFixed(2)} h</div>
+   <div>Total salaire brut : ${sumPay.toFixed(2)} $</div>
+ `;
+
+ // delete handlers
+ document.querySelectorAll(".delBtn").forEach(btn=>{
+   btn.onclick = e=>{
+     const i=e.target.dataset.i;
+     shifts.splice(i,1); saveShifts(shifts); render();
+   }
+ });
+}
+
+document.getElementById("addShiftBtn").onclick = ()=>{
+ const date=document.getElementById("date").value;
+ const start=document.getElementById("startTime").value;
+ const end=document.getElementById("endTime").value;
+ const pause=Number(document.getElementById("pause").value||0);
+
+ if(!date||!start||!end){ alert("Remplis la date, entrée, sortie."); return; }
+
+ shifts.push({date,start,end,pauseMin:pause});
+ saveShifts(shifts);
+
+ document.getElementById("startTime").value="";
+ document.getElementById("endTime").value="";
+ document.getElementById("pause").value="0";
+
+ render();
+};
+
+document.getElementById("clearBtn").onclick = ()=>{
+ if(confirm("Effacer tous les shifts ?")){
+   shifts=[]; saveShifts(shifts); render();
+ }
+};
+
+document.getElementById("exportBtn").onclick = ()=>{
+ if(shifts.length===0){ alert("Rien à exporter"); return; }
+ const rate=loadRate();
+ const rows=[["date","start","end","pause","hours","night","weekend","pay"]];
+ shifts.forEach(s=>{
+   const a=analyze(s,rate);
+   rows.push([s.date,s.start,s.end,s.pauseMin,a.hours.toFixed(2),a.nightH.toFixed(2),a.weekendH.toFixed(2),a.totalPay.toFixed(2)]);
+ });
+ const csv=rows.map(r=>r.join(",")).join("\n");
+ const blob=new Blob([csv],{type:"text/csv"});
+ const url=URL.createObjectURL(blob);
+ const a=document.createElement("a");
+ a.href=url;a.download="shifts.csv";a.click();URL.revokeObjectURL(url);
+};
+
+document.getElementById("date").value = new Date().toISOString().slice(0,10);
+render();
+</script>
+
+</body>
+</html>
